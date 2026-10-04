@@ -1,0 +1,112 @@
+# This workflow runs on every pull request created to main.
+
+name: PR checks
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write   # To post the coverage comment.
+
+env:
+  COVERAGE_THRESHOLD: ${{ vars.COVERAGE_THRESHOLD || '80' }}
+  SCREENSHOT_FILE: coverage-pr-${{ github.event.pull_request.number }}.png
+
+jobs:
+  build-test-coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+        # NOTE: Requires the coverlet.collector package in the test project.
+      - name: Test with coverage
+        run: >
+          dotnet test --configuration Release --no-build
+          --collect:"XPlat Code Coverage"
+          --results-directory ./coverage
+
+      - name: Install ReportGenerator
+        run: dotnet tool install --global dotnet-reportgenerator-globaltool
+
+      - name: Generate coverage report
+        run: >
+          reportgenerator
+          -reports:"coverage/**/coverage.cobertura.xml"
+          -targetdir:"coverage-report"
+          -reporttypes:"Html;MarkdownSummaryGithub;JsonSummary"
+
+      - name: Screenshot the report
+        run: >
+          google-chrome --headless --no-sandbox --disable-gpu --hide-scrollbars
+          --virtual-time-budget=5000
+          --window-size=1280,1600
+          --screenshot="$SCREENSHOT_FILE"
+          "file://$PWD/coverage-report/index.html"
+
+      - name: Upload HTML report
+        id: upload-html
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report-pr-${{ github.event.pull_request.number }}
+          path: coverage-report/
+          retention-days: 60
+
+      - name: Upload screenshot
+        id: upload-png
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ env.SCREENSHOT_FILE }}
+          archive: false
+          retention-days: 60
+
+      - name: Add summary to the run page
+        run: cat coverage-report/SummaryGithub.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on PR
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HTML_URL: ${{ steps.upload-html.outputs.artifact-url }}
+          PNG_URL: ${{ steps.upload-png.outputs.artifact-url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          {
+            echo "## Code coverage report"
+            echo
+            cat coverage-report/SummaryGithub.md
+            echo
+            echo "**Screenshot of the report:** [view image]($PNG_URL)"
+            echo
+            echo "**Full HTML report:** [download artifact]($HTML_URL)"
+          } > comment.md
+          gh pr comment "$PR_NUMBER" --body-file comment.md --edit-last --create-if-none
+
+      - name: Enforce coverage threshold
+        run: |
+          COVERAGE=$(jq '.summary.linecoverage' coverage-report/Summary.json)
+          echo "Line coverage: ${COVERAGE}% (required: ${COVERAGE_THRESHOLD}%)"
+          if ! awk -v c="$COVERAGE" -v t="$COVERAGE_THRESHOLD" 'BEGIN { exit !(c >= t) }'; then
+            echo "::error::Coverage ${COVERAGE}% is below the required ${COVERAGE_THRESHOLD}%"
+            exit 1
+          fi
+
